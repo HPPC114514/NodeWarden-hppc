@@ -13,7 +13,7 @@ persist = true
 invocation_logs = true
 
 [observability.traces]
-enabled = false
+enabled = true
 
 [assets]
 binding = "ASSETS"
@@ -42,12 +42,6 @@ bucket_name = "nodewarden-attachments"
 [[migrations]]
 tag = "v1-notifications-hub"
 new_sqlite_classes = [ "NotificationsHub" ]
-
-[observability.logs]
-enabled = true
-invocation_logs = true
-[observability.traces]
-enabled = true
 
 [placement]
 mode = "smart"
