@@ -43,7 +43,6 @@ bucket_name = "nodewarden-attachments"
 tag = "v1-notifications-hub"
 new_sqlite_classes = [ "NotificationsHub" ]
 
-[observability]
 [observability.logs]
 enabled = true
 invocation_logs = true
