@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT NOT NULL UNIQUE,
   name TEXT,
+  master_password_hint TEXT,
   master_password_hash TEXT NOT NULL,
   key TEXT NOT NULL,
   private_key TEXT,
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS users (
   security_stamp TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'user',
   status TEXT NOT NULL DEFAULT 'active',
+  verify_devices INTEGER NOT NULL DEFAULT 1,
   totp_secret TEXT,
   totp_recovery_code TEXT,
   created_at TEXT NOT NULL,
@@ -50,10 +52,12 @@ CREATE TABLE IF NOT EXISTS ciphers (
   key TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  archived_at TEXT,
   deleted_at TEXT,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_ciphers_user_updated ON ciphers(user_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_ciphers_user_archived ON ciphers(user_id, archived_at);
 CREATE INDEX IF NOT EXISTS idx_ciphers_user_deleted ON ciphers(user_id, deleted_at);
 
 CREATE TABLE IF NOT EXISTS folders (
@@ -143,6 +147,10 @@ CREATE TABLE IF NOT EXISTS devices (
   device_identifier TEXT NOT NULL,
   name TEXT NOT NULL,
   type INTEGER NOT NULL,
+  session_stamp TEXT,
+  encrypted_user_key TEXT,
+  encrypted_public_key TEXT,
+  encrypted_private_key TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (user_id, device_identifier),
@@ -180,3 +188,30 @@ CREATE TABLE IF NOT EXISTS used_attachment_download_tokens (
   jti TEXT PRIMARY KEY,
   expires_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  credential_id TEXT NOT NULL UNIQUE,
+  public_key TEXT NOT NULL,
+  counter INTEGER NOT NULL DEFAULT 0,
+  transports TEXT,
+  name TEXT NOT NULL,
+  wrapped_vault_keys TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_used_at TEXT,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_passkey_credentials_user ON passkey_credentials(user_id);
+
+CREATE TABLE IF NOT EXISTS passkey_challenges (
+  id TEXT PRIMARY KEY,
+  user_id TEXT,
+  challenge TEXT NOT NULL,
+  action TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_passkey_challenges_expiry ON passkey_challenges(expires_at);

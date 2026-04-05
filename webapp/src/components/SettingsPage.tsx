@@ -4,15 +4,21 @@ import { copyTextToClipboard } from '@/lib/clipboard';
 import qrcode from 'qrcode-generator';
 import type { Profile } from '@/lib/types';
 import { t } from '@/lib/i18n';
+import ConfirmDialog from '@/components/ConfirmDialog';
 
 interface SettingsPageProps {
   profile: Profile;
   totpEnabled: boolean;
   onChangePassword: (currentPassword: string, nextPassword: string, nextPassword2: string) => Promise<void>;
+  onSavePasswordHint: (masterPasswordHint: string) => Promise<void>;
   onEnableTotp: (secret: string, token: string) => Promise<void>;
   onOpenDisableTotp: () => void;
   onGetRecoveryCode: (masterPassword: string) => Promise<string>;
   onNotify?: (type: 'success' | 'error', text: string) => void;
+  passkeys: Array<{ id: string; name: string; creationDate: string; lastUsedDate: string | null }>;
+  onCreatePasskey: (name: string) => Promise<void>;
+  onRenamePasskey: (id: string, name: string) => Promise<void>;
+  onDeletePasskey: (id: string) => Promise<void>;
 }
 
 function randomBase32Secret(length: number): string {
@@ -40,11 +46,16 @@ export default function SettingsPage(props: SettingsPageProps) {
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newPassword2, setNewPassword2] = useState('');
+  const [passwordHint, setPasswordHint] = useState(props.profile.masterPasswordHint || '');
   const [secret, setSecret] = useState(() => localStorage.getItem(totpSecretStorageKey) || randomBase32Secret(32));
   const [token, setToken] = useState('');
   const [totpLocked, setTotpLocked] = useState(props.totpEnabled);
   const [recoveryMasterPassword, setRecoveryMasterPassword] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
+  const [passkeyName, setPasskeyName] = useState('');
+  const [renamePasskey, setRenamePasskey] = useState<{ id: string; name: string } | null>(null);
+  const [renamePasskeyName, setRenamePasskeyName] = useState('');
+  const [deletePasskey, setDeletePasskey] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => {
     if (!props.totpEnabled) {
@@ -54,11 +65,16 @@ export default function SettingsPage(props: SettingsPageProps) {
     setTotpLocked(true);
   }, [props.totpEnabled]);
 
+  useEffect(() => {
+    setPasswordHint(props.profile.masterPasswordHint || '');
+  }, [props.profile.masterPasswordHint]);
+
   const qrDataUrl = useMemo(() => {
     const qr = qrcode(0, 'M');
     qr.addData(buildOtpUri(props.profile.email, secret));
     qr.make();
-    const svg = qr.createSvgTag({ scalable: true, margin: 0 });
+    // Keep a visible quiet zone so authenticator apps can scan reliably in both themes.
+    const svg = qr.createSvgTag({ scalable: true, margin: 4 });
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   }, [props.profile.email, secret]);
 
@@ -79,8 +95,52 @@ export default function SettingsPage(props: SettingsPageProps) {
     props.onNotify?.('success', t('txt_recovery_code_loaded'));
   }
 
+  function formatDateTime(value: string | null | undefined): string {
+    if (!value) return t('txt_dash');
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleString();
+  }
+
+  async function confirmRenamePasskey(): Promise<void> {
+    if (!renamePasskey) return;
+    const nextName = renamePasskeyName.trim();
+    if (!nextName) return;
+    await props.onRenamePasskey(renamePasskey.id, nextName);
+    setRenamePasskey(null);
+    setRenamePasskeyName('');
+  }
+
+  async function confirmDeletePasskey(): Promise<void> {
+    if (!deletePasskey) return;
+    await props.onDeletePasskey(deletePasskey.id);
+    setDeletePasskey(null);
+  }
+
   return (
     <div className="stack">
+      <section className="card">
+        <h3>{t('txt_profile')}</h3>
+        <label className="field">
+          <span>{t('txt_password_hint_optional')}</span>
+          <input
+            className="input"
+            maxLength={120}
+            value={passwordHint}
+            placeholder={t('txt_password_hint_placeholder')}
+            onInput={(e) => setPasswordHint((e.currentTarget as HTMLInputElement).value)}
+          />
+          <div className="field-help">{t('txt_password_hint_register_help')}</div>
+        </label>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={() => void props.onSavePasswordHint(passwordHint)}
+        >
+          {t('txt_save_profile')}
+        </button>
+      </section>
+
       <section className="card">
         <h3>{t('txt_change_master_password')}</h3>
         <label className="field">
@@ -111,6 +171,91 @@ export default function SettingsPage(props: SettingsPageProps) {
           {t('txt_change_password')}
         </button>
       </section>
+
+      <section className="card">
+        <h3>Passkey</h3>
+        <div className="field-grid">
+          <label className="field">
+            <span>名称</span>
+            <input className="input" value={passkeyName} onInput={(e) => setPasskeyName((e.currentTarget as HTMLInputElement).value)} placeholder="例如：MacBook Touch ID" />
+          </label>
+          <div className="field" style={{ alignSelf: 'end' }}>
+            <button type="button" className="btn btn-primary" disabled={!passkeyName.trim()} onClick={() => void props.onCreatePasskey(passkeyName.trim()).then(() => setPasskeyName(''))}>
+              创建 Passkey
+            </button>
+          </div>
+        </div>
+        <p className="muted-inline" style={{ marginBottom: 8 }}>最多 5 个，支持重命名和删除。</p>
+        <div className="stack" style={{ gap: 6 }}>
+          {props.passkeys.map((item) => (
+            <div
+              key={item.id}
+              style={{
+                display: 'flex',
+                gap: 8,
+                alignItems: 'center',
+                border: '1px solid var(--line)',
+                borderRadius: 10,
+                padding: '10px 12px',
+                flexWrap: 'wrap',
+              }}
+            >
+              <strong>{item.name}</strong>
+              <span style={{ marginLeft: 'auto', fontSize: 12, opacity: 0.72 }}>
+                创建于 {formatDateTime(item.creationDate)}
+              </span>
+              <button
+                type="button"
+                className="btn btn-secondary small"
+                onClick={() => {
+                  setRenamePasskey({ id: item.id, name: item.name });
+                  setRenamePasskeyName(item.name);
+                }}
+              >
+                {t('txt_edit')}
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger small"
+                onClick={() => setDeletePasskey({ id: item.id, name: item.name })}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          {!props.passkeys.length && <div className="empty">暂无 Passkey</div>}
+        </div>
+      </section>
+
+      <ConfirmDialog
+        open={!!renamePasskey}
+        title={t('txt_edit')}
+        message={t('txt_enter_a_folder_name')}
+        confirmText={t('txt_save')}
+        cancelText={t('txt_cancel')}
+        onConfirm={() => void confirmRenamePasskey()}
+        onCancel={() => {
+          setRenamePasskey(null);
+          setRenamePasskeyName('');
+        }}
+      >
+        <label className="field">
+          <span>{t('txt_name')}</span>
+          <input className="input" value={renamePasskeyName} onInput={(e) => setRenamePasskeyName((e.currentTarget as HTMLInputElement).value)} />
+        </label>
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={!!deletePasskey}
+        title={t('txt_delete')}
+        message={deletePasskey ? `确认删除 Passkey「${deletePasskey.name}」吗？` : ''}
+        variant="warning"
+        danger
+        confirmText={t('txt_delete')}
+        cancelText={t('txt_cancel')}
+        onConfirm={() => void confirmDeletePasskey()}
+        onCancel={() => setDeletePasskey(null)}
+      />
 
       <section className="card">
         <div className="settings-twofactor-grid">

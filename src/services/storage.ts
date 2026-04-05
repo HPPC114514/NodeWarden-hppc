@@ -1,4 +1,4 @@
-import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord } from '../types';
+import { User, Cipher, Folder, Attachment, Device, Invite, AuditLog, Send, TrustedDeviceTokenSummary, RefreshTokenRecord, PasskeyCredential } from '../types';
 import { LIMITS } from '../config/limits';
 import { ensureStorageSchema } from './storage-schema';
 import {
@@ -36,10 +36,12 @@ import {
   saveFolder as saveStoredFolder,
 } from './storage-folder-repo';
 import {
+  bulkArchiveCiphers as archiveStoredCiphers,
   bulkDeleteCiphers as deleteStoredCiphers,
   bulkMoveCiphers as moveStoredCiphers,
   bulkRestoreCiphers as restoreStoredCiphers,
   bulkSoftDeleteCiphers as softDeleteStoredCiphers,
+  bulkUnarchiveCiphers as unarchiveStoredCiphers,
   getAllCiphers as listStoredCiphers,
   getCipher as findStoredCipher,
   getCiphersByIds as listStoredCiphersByIds,
@@ -80,6 +82,7 @@ import {
 import {
   deleteDevice as deleteStoredDevice,
   deleteDevicesByUserId as deleteStoredDevicesByUserId,
+  clearDeviceKeys as clearStoredDeviceKeys,
   deleteTrustedTwoFactorTokensByDevice as deleteStoredTrustedTokensByDevice,
   deleteTrustedTwoFactorTokensByUserId as deleteStoredTrustedTokensByUserId,
   getDevice as findStoredDevice,
@@ -90,6 +93,7 @@ import {
   isKnownDeviceByEmail as getKnownStoredDeviceByEmail,
   saveTrustedTwoFactorDeviceToken as saveStoredTrustedDeviceToken,
   upsertDevice as saveStoredDevice,
+  updateDeviceKeys as updateStoredDeviceKeys,
 } from './storage-device-repo';
 import {
   ensureUsedAttachmentDownloadTokenTable as ensureStoredAttachmentTokenTable,
@@ -102,7 +106,7 @@ import {
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const STORAGE_SCHEMA_VERSION_KEY = 'schema.version';
-const STORAGE_SCHEMA_VERSION = '2026-03-18.1';
+const STORAGE_SCHEMA_VERSION = '2026-03-30.1';
 
 // D1-backed storage.
 // Contract:
@@ -284,6 +288,14 @@ export class StorageService {
 
   async bulkRestoreCiphers(ids: string[], userId: string): Promise<string | null> {
     return restoreStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  }
+
+  async bulkArchiveCiphers(ids: string[], userId: string): Promise<string | null> {
+    return archiveStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
+  }
+
+  async bulkUnarchiveCiphers(ids: string[], userId: string): Promise<string | null> {
+    return unarchiveStoredCiphers(this.db, this.sqlChunkSize.bind(this), this.updateRevisionDate.bind(this), ids, userId);
   }
 
   async bulkDeleteCiphers(ids: string[], userId: string): Promise<string | null> {
@@ -495,8 +507,19 @@ export class StorageService {
 
   // --- Devices ---
 
-  async upsertDevice(userId: string, deviceIdentifier: string, name: string, type: number, sessionStamp?: string): Promise<void> {
-    await saveStoredDevice(this.db, this.getDevice.bind(this), userId, deviceIdentifier, name, type, sessionStamp);
+  async upsertDevice(
+    userId: string,
+    deviceIdentifier: string,
+    name: string,
+    type: number,
+    sessionStamp?: string,
+    keys?: {
+      encryptedUserKey?: string | null;
+      encryptedPublicKey?: string | null;
+      encryptedPrivateKey?: string | null;
+    }
+  ): Promise<void> {
+    await saveStoredDevice(this.db, this.getDevice.bind(this), userId, deviceIdentifier, name, type, sessionStamp, keys);
   }
 
   async isKnownDevice(userId: string, deviceIdentifier: string): Promise<boolean> {
@@ -513,6 +536,22 @@ export class StorageService {
 
   async getDevice(userId: string, deviceIdentifier: string): Promise<Device | null> {
     return findStoredDevice(this.db, userId, deviceIdentifier);
+  }
+
+  async updateDeviceKeys(
+    userId: string,
+    deviceIdentifier: string,
+    keys: {
+      encryptedUserKey?: string | null;
+      encryptedPublicKey?: string | null;
+      encryptedPrivateKey?: string | null;
+    }
+  ): Promise<boolean> {
+    return updateStoredDeviceKeys(this.db, userId, deviceIdentifier, keys);
+  }
+
+  async clearDeviceKeys(userId: string, deviceIdentifiers: string[]): Promise<number> {
+    return clearStoredDeviceKeys(this.db, userId, deviceIdentifiers);
   }
 
   async deleteDevice(userId: string, deviceIdentifier: string): Promise<boolean> {
@@ -549,6 +588,90 @@ export class StorageService {
 
   async getTrustedTwoFactorDeviceTokenUserId(token: string, deviceIdentifier: string): Promise<string | null> {
     return findStoredTrustedTokenUserId(this.db, this.trustedTwoFactorTokenKey.bind(this), token, deviceIdentifier);
+  }
+
+  // --- Passkeys ---
+
+  async createPasskeyChallenge(id: string, userId: string | null, challenge: string, action: 'register' | 'login', expiresAt: number): Promise<void> {
+    await this.db
+      .prepare('INSERT OR REPLACE INTO passkey_challenges(id, user_id, challenge, action, expires_at, created_at) VALUES(?, ?, ?, ?, ?, ?)')
+      .bind(id, userId, challenge, action, expiresAt, new Date().toISOString())
+      .run();
+  }
+
+  async consumePasskeyChallenge(id: string, action: 'register' | 'login'): Promise<{ challenge: string; userId: string | null } | null> {
+    const now = Date.now();
+    const row = await this.db
+      .prepare('SELECT challenge, user_id as userId FROM passkey_challenges WHERE id = ? AND action = ? AND expires_at > ?')
+      .bind(id, action, now)
+      .first<{ challenge: string; userId: string | null }>();
+    await this.db.prepare('DELETE FROM passkey_challenges WHERE id = ?').bind(id).run();
+    return row || null;
+  }
+
+  async listPasskeysByUserId(userId: string): Promise<PasskeyCredential[]> {
+    const rows = await this.db
+      .prepare('SELECT id, user_id, credential_id, public_key, counter, transports, name, wrapped_vault_keys, created_at, updated_at, last_used_at FROM passkey_credentials WHERE user_id = ? ORDER BY created_at ASC')
+      .bind(userId)
+      .all<Record<string, unknown>>();
+    return (rows.results || []).map((row) => ({
+      id: String(row.id),
+      userId: String(row.user_id),
+      credentialId: String(row.credential_id),
+      publicKey: String(row.public_key),
+      counter: Number(row.counter || 0),
+      transports: row.transports == null ? null : String(row.transports),
+      name: String(row.name || ''),
+      wrappedVaultKeys: String(row.wrapped_vault_keys || ''),
+      createdAt: String(row.created_at || ''),
+      updatedAt: String(row.updated_at || ''),
+      lastUsedAt: row.last_used_at == null ? null : String(row.last_used_at),
+    }));
+  }
+
+  async getPasskeyByCredentialId(credentialId: string): Promise<PasskeyCredential | null> {
+    const row = await this.db
+      .prepare('SELECT id, user_id, credential_id, public_key, counter, transports, name, wrapped_vault_keys, created_at, updated_at, last_used_at FROM passkey_credentials WHERE credential_id = ?')
+      .bind(credentialId)
+      .first<Record<string, unknown>>();
+    if (!row) return null;
+    return {
+      id: String(row.id),
+      userId: String(row.user_id),
+      credentialId: String(row.credential_id),
+      publicKey: String(row.public_key || ''),
+      counter: Number(row.counter || 0),
+      transports: row.transports == null ? null : String(row.transports),
+      name: String(row.name || ''),
+      wrappedVaultKeys: String(row.wrapped_vault_keys || ''),
+      createdAt: String(row.created_at || ''),
+      updatedAt: String(row.updated_at || ''),
+      lastUsedAt: row.last_used_at == null ? null : String(row.last_used_at),
+    };
+  }
+
+  async createPasskey(record: PasskeyCredential): Promise<void> {
+    await this.db
+      .prepare('INSERT INTO passkey_credentials(id, user_id, credential_id, public_key, counter, transports, name, wrapped_vault_keys, created_at, updated_at, last_used_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(record.id, record.userId, record.credentialId, record.publicKey, record.counter, record.transports, record.name, record.wrappedVaultKeys, record.createdAt, record.updatedAt, record.lastUsedAt)
+      .run();
+  }
+
+  async updatePasskeyName(userId: string, id: string, name: string): Promise<boolean> {
+    const result = await this.db
+      .prepare('UPDATE passkey_credentials SET name = ?, updated_at = ? WHERE id = ? AND user_id = ?')
+      .bind(name, new Date().toISOString(), id, userId)
+      .run();
+    return (result.meta?.changes || 0) > 0;
+  }
+
+  async deletePasskey(userId: string, id: string): Promise<boolean> {
+    const result = await this.db.prepare('DELETE FROM passkey_credentials WHERE id = ? AND user_id = ?').bind(id, userId).run();
+    return (result.meta?.changes || 0) > 0;
+  }
+
+  async touchPasskeyUsage(id: string): Promise<void> {
+    await this.db.prepare('UPDATE passkey_credentials SET last_used_at = ?, updated_at = ? WHERE id = ?').bind(new Date().toISOString(), new Date().toISOString(), id).run();
   }
 
   // --- Revision dates ---

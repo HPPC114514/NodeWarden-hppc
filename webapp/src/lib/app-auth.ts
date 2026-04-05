@@ -4,6 +4,7 @@ import {
   getProfile,
   loadSession,
   loginWithPassword,
+  loginWithPasskey,
   refreshAccessToken,
   recoverTwoFactor,
   registerAccount,
@@ -44,6 +45,11 @@ export interface CompletedLogin {
 export type PasswordLoginResult =
   | { kind: 'success'; login: CompletedLogin }
   | { kind: 'totp'; pendingTotp: PendingTotp }
+  | { kind: 'error'; message: string };
+
+export type PasskeyLoginResult =
+  | { kind: 'success'; login: CompletedLogin }
+  | { kind: 'totp' }
   | { kind: 'error'; message: string };
 
 export interface RecoverTwoFactorResult {
@@ -92,6 +98,35 @@ function readWindowBootstrap(): WebBootstrapResponse {
   return raw && typeof raw === 'object' ? raw : {};
 }
 
+function normalizeBootstrapResponse(boot: WebBootstrapResponse): Pick<InitialAppBootstrapState, 'defaultKdfIterations' | 'jwtWarning'> {
+  const defaultKdfIterations = Number(boot.defaultKdfIterations || 600000);
+  const jwtUnsafeReason = boot.jwtUnsafeReason || null;
+  const jwtWarning = jwtUnsafeReason
+    ? {
+        reason: jwtUnsafeReason,
+        minLength: Number(boot.jwtSecretMinLength || 32),
+      }
+    : null;
+
+  return {
+    defaultKdfIterations,
+    jwtWarning,
+  };
+}
+
+async function fetchBootstrapConfig(): Promise<WebBootstrapResponse> {
+  try {
+    const resp = await fetch('/api/web-bootstrap', {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+    });
+    if (!resp.ok) return {};
+    return ((await resp.json()) as WebBootstrapResponse) || {};
+  } catch {
+    return {};
+  }
+}
+
 interface AccessTokenClaims {
   sub?: string;
   email?: string;
@@ -129,15 +164,7 @@ function buildTransientProfile(token: TokenSuccess, email: string): Profile {
 }
 
 export function readInitialAppBootstrapState(): InitialAppBootstrapState {
-  const boot = readWindowBootstrap();
-  const defaultKdfIterations = Number(boot.defaultKdfIterations || 600000);
-  const jwtUnsafeReason = boot.jwtUnsafeReason || null;
-  const jwtWarning = jwtUnsafeReason
-    ? {
-        reason: jwtUnsafeReason,
-        minLength: Number(boot.jwtSecretMinLength || 32),
-      }
-    : null;
+  const { defaultKdfIterations, jwtWarning } = normalizeBootstrapResponse(readWindowBootstrap());
   const session = loadSession();
   const hasInviteCode = !!readInviteCodeFromUrl();
 
@@ -149,10 +176,11 @@ export function readInitialAppBootstrapState(): InitialAppBootstrapState {
   };
 }
 
-export async function bootstrapAppSession(): Promise<BootstrapAppResult> {
-  const initial = readInitialAppBootstrapState();
-  const defaultKdfIterations = initial.defaultKdfIterations;
-  const jwtWarning = initial.jwtWarning;
+export async function bootstrapAppSession(initial: InitialAppBootstrapState = readInitialAppBootstrapState()): Promise<BootstrapAppResult> {
+  const remoteBoot = await fetchBootstrapConfig();
+  const normalizedBoot = normalizeBootstrapResponse(remoteBoot);
+  const defaultKdfIterations = normalizedBoot.defaultKdfIterations || initial.defaultKdfIterations;
+  const jwtWarning = normalizedBoot.jwtWarning ?? initial.jwtWarning;
 
   if (jwtWarning) {
     return {
@@ -309,6 +337,7 @@ export async function performRegistration(args: {
   email: string;
   name: string;
   password: string;
+  masterPasswordHint: string;
   inviteCode: string;
   fallbackIterations: number;
 }) {
@@ -316,6 +345,7 @@ export async function performRegistration(args: {
     email: args.email.trim().toLowerCase(),
     name: args.name.trim(),
     password: args.password,
+    masterPasswordHint: args.masterPasswordHint.trim(),
     inviteCode: args.inviteCode.trim(),
     fallbackIterations: args.fallbackIterations,
   });
@@ -334,4 +364,31 @@ export async function performUnlock(
     throw new Error('Session expired');
   }
   return { ...refreshedSession, ...keys };
+}
+
+export async function performPasskeyLogin(email: string, totpCode?: string): Promise<PasskeyLoginResult> {
+  const token = await loginWithPasskey(email, totpCode);
+  if ('access_token' in token && token.access_token) {
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const baseSession: SessionState = {
+      accessToken: token.access_token,
+      refreshToken: token.refresh_token,
+      email: normalizedEmail,
+      symEncKey: token.VaultKeys?.symEncKey,
+      symMacKey: token.VaultKeys?.symMacKey,
+    };
+    const tempFetch = createAuthedFetch(() => baseSession, () => {});
+    const profile = buildTransientProfile(token, normalizedEmail);
+    return {
+      kind: 'success',
+      login: {
+        session: baseSession,
+        profile,
+        profilePromise: getProfile(tempFetch),
+      },
+    };
+  }
+  const tokenError = token as { TwoFactorProviders?: unknown; error_description?: string; error?: string };
+  if (tokenError.TwoFactorProviders) return { kind: 'totp' };
+  return { kind: 'error', message: tokenError.error_description || tokenError.error || 'Passkey login failed' };
 }

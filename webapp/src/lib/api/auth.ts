@@ -8,6 +8,7 @@ import type {
   TokenSuccess,
 } from '../types';
 import { parseJson, type AuthedFetch, type SessionSetter } from './shared';
+import { createPasskeyCredential, requestPasskeyAssertion } from '../passkey';
 
 const SESSION_KEY = 'nodewarden.web.session.v4';
 const DEVICE_IDENTIFIER_KEY = 'nodewarden.web.device.identifier.v1';
@@ -24,6 +25,14 @@ export interface PreloginKdfConfig {
   kdfIterations: number;
   kdfMemory: number | null;
   kdfParallelism: number | null;
+}
+
+export interface AccountPasskey {
+  id: string;
+  name: string;
+  creationDate: string;
+  revisionDate: string;
+  lastUsedDate: string | null;
 }
 
 function randomHex(length: number): string {
@@ -197,15 +206,94 @@ export async function refreshAccessToken(refreshToken: string): Promise<TokenSuc
   return json || null;
 }
 
+export async function listAccountPasskeys(authedFetch: AuthedFetch): Promise<AccountPasskey[]> {
+  const resp = await authedFetch('/api/accounts/passkeys');
+  if (!resp.ok) throw new Error('Failed to load passkeys');
+  const body = (await parseJson<{ data?: AccountPasskey[] }>(resp)) || {};
+  return Array.isArray(body.data) ? body.data : [];
+}
+
+export async function registerAccountPasskey(authedFetch: AuthedFetch, name: string, session: SessionState): Promise<void> {
+  const beginResp = await authedFetch('/api/accounts/passkeys/begin-registration', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  if (!beginResp.ok) throw new Error('Failed to start passkey registration');
+  const begin = (await parseJson<{ challengeId: string; publicKey: Record<string, any> }>(beginResp)) || {};
+  if (!begin.challengeId || !begin.publicKey) throw new Error('Invalid registration challenge');
+
+  const credential = await createPasskeyCredential(begin.publicKey);
+  const finishResp = await authedFetch('/api/accounts/passkeys/finish-registration', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      challengeId: begin.challengeId,
+      name,
+      wrappedVaultKeys: JSON.stringify({
+        symEncKey: session.symEncKey || '',
+        symMacKey: session.symMacKey || '',
+      }),
+      credential,
+    }),
+  });
+  if (!finishResp.ok) {
+    const err = await parseJson<TokenError>(finishResp);
+    throw new Error(err?.error_description || err?.error || 'Failed to finish passkey registration');
+  }
+}
+
+export async function renameAccountPasskey(authedFetch: AuthedFetch, passkeyId: string, name: string): Promise<void> {
+  const resp = await authedFetch(`/api/accounts/passkeys/${passkeyId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!resp.ok) throw new Error('Failed to rename passkey');
+}
+
+export async function deleteAccountPasskey(authedFetch: AuthedFetch, passkeyId: string): Promise<void> {
+  const resp = await authedFetch(`/api/accounts/passkeys/${passkeyId}`, { method: 'DELETE' });
+  if (!resp.ok && resp.status !== 204) throw new Error('Failed to delete passkey');
+}
+
+export async function loginWithPasskey(email?: string, totpCode?: string): Promise<TokenSuccess | TokenError> {
+  const beginResp = await fetch('/identity/passkeys/begin-login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: String(email || '').trim().toLowerCase() || undefined }),
+  });
+  if (!beginResp.ok) return ((await parseJson<TokenError>(beginResp)) || {});
+  const begin = (await parseJson<{ challengeId: string; publicKey: Record<string, any> }>(beginResp)) || {};
+  if (!begin.challengeId || !begin.publicKey) return { error: 'Passkey challenge missing' };
+
+  const credential = await requestPasskeyAssertion(begin.publicKey);
+  const finishResp = await fetch('/identity/passkeys/finish-login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      challengeId: begin.challengeId,
+      credential,
+      deviceIdentifier: getOrCreateDeviceIdentifier(),
+      deviceName: guessDeviceName(),
+      deviceType: '14',
+      twoFactorToken: totpCode || undefined,
+    }),
+  });
+  const result = (await parseJson<TokenSuccess & TokenError>(finishResp)) || {};
+  return result;
+}
+
 export async function registerAccount(args: {
   email: string;
   name: string;
   password: string;
+  masterPasswordHint?: string;
   inviteCode?: string;
   fallbackIterations: number;
 }): Promise<{ ok: true } | { ok: false; message: string }> {
   try {
-    const { email, name, password, inviteCode, fallbackIterations } = args;
+    const { email, name, password, masterPasswordHint, inviteCode, fallbackIterations } = args;
     const masterKey = await pbkdf2(password, email, fallbackIterations, 32);
     const masterHash = await pbkdf2(masterKey, password, 1, 32);
     const encKey = await hkdfExpand(masterKey, 'enc', 32);
@@ -233,6 +321,7 @@ export async function registerAccount(args: {
       body: JSON.stringify({
         email: email.toLowerCase(),
         name,
+        masterPasswordHint: String(masterPasswordHint || '').trim() || undefined,
         masterPasswordHash: bytesToBase64(masterHash),
         key: encryptedVaultKey,
         kdf: 0,
@@ -253,6 +342,20 @@ export async function registerAccount(args: {
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : 'Register failed' };
   }
+}
+
+export async function getPasswordHint(email: string): Promise<{ masterPasswordHint: string | null }> {
+  const resp = await fetch('/api/accounts/password-hint', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: email.trim().toLowerCase() }),
+  });
+  if (!resp.ok) {
+    const body = await parseJson<TokenError>(resp);
+    throw new Error(body?.error_description || body?.error || 'Failed to load password hint');
+  }
+  const body = (await parseJson<{ masterPasswordHint?: string | null }>(resp)) || {};
+  return { masterPasswordHint: body.masterPasswordHint ?? null };
 }
 
 export function createAuthedFetch(getSession: () => SessionState | null, setSession: SessionSetter) {
@@ -289,6 +392,26 @@ export function createAuthedFetch(getSession: () => SessionState | null, setSess
 export async function getProfile(authedFetch: AuthedFetch): Promise<Profile> {
   const resp = await authedFetch('/api/accounts/profile');
   if (!resp.ok) throw new Error('Failed to load profile');
+  const body = await parseJson<Profile>(resp);
+  if (!body) throw new Error('Invalid profile');
+  return body;
+}
+
+export async function updateProfile(
+  authedFetch: AuthedFetch,
+  payload: { masterPasswordHint: string }
+): Promise<Profile> {
+  const resp = await authedFetch('/api/accounts/profile', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      masterPasswordHint: String(payload.masterPasswordHint || '').trim() || null,
+    }),
+  });
+  if (!resp.ok) {
+    const body = await parseJson<TokenError>(resp);
+    throw new Error(body?.error_description || body?.error || 'Save profile failed');
+  }
   const body = await parseJson<Profile>(resp);
   if (!body) throw new Error('Invalid profile');
   return body;

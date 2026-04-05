@@ -8,6 +8,8 @@ interface VaultDialogsProps {
   fieldType: CustomFieldType;
   fieldLabel: string;
   fieldValue: string;
+  archiveConfirmOpen: boolean;
+  bulkArchiveOpen: boolean;
   pendingDeleteOpen: boolean;
   bulkDeleteOpen: boolean;
   sidebarTrashMode: boolean;
@@ -17,6 +19,8 @@ interface VaultDialogsProps {
   folders: Folder[];
   createFolderOpen: boolean;
   newFolderName: string;
+  renameFolderOpen: boolean;
+  renameFolderName: string;
   pendingDeleteFolder: Folder | null;
   deleteAllFoldersOpen: boolean;
   repromptOpen: boolean;
@@ -26,6 +30,10 @@ interface VaultDialogsProps {
   onFieldTypeChange: (value: CustomFieldType) => void;
   onFieldLabelChange: (value: string) => void;
   onFieldValueChange: (value: string) => void;
+  onConfirmArchive: () => void;
+  onCancelArchive: () => void;
+  onConfirmBulkArchive: () => void;
+  onCancelBulkArchive: () => void;
   onConfirmDelete: () => void;
   onCancelDelete: () => void;
   onConfirmBulkDelete: () => void;
@@ -36,6 +44,9 @@ interface VaultDialogsProps {
   onConfirmCreateFolder: () => void;
   onCancelCreateFolder: () => void;
   onNewFolderNameChange: (value: string) => void;
+  onConfirmRenameFolder: () => void;
+  onCancelRenameFolder: () => void;
+  onRenameFolderNameChange: (value: string) => void;
   onConfirmDeleteFolder: () => void;
   onCancelDeleteFolder: () => void;
   onConfirmDeleteAllFolders: () => void;
@@ -88,6 +99,26 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         )}
       </ConfirmDialog>
 
+      <ConfirmDialog
+        open={props.archiveConfirmOpen}
+        title={t('txt_archive_item')}
+        message={t('txt_archive_item_message')}
+        confirmText={t('txt_archive')}
+        cancelText={t('txt_cancel')}
+        onConfirm={props.onConfirmArchive}
+        onCancel={props.onCancelArchive}
+      />
+
+      <ConfirmDialog
+        open={props.bulkArchiveOpen}
+        title={t('txt_archive_selected_items')}
+        message={t('txt_archive_selected_items_message', { count: props.selectedCount })}
+        confirmText={t('txt_archive')}
+        cancelText={t('txt_cancel')}
+        onConfirm={props.onConfirmBulkArchive}
+        onCancel={props.onCancelBulkArchive}
+      />
+
       <ConfirmDialog open={props.pendingDeleteOpen} title={t('txt_delete_item')} message={t('txt_are_you_sure_you_want_to_delete_this_item')} danger onConfirm={props.onConfirmDelete} onCancel={props.onCancelDelete} />
 
       <ConfirmDialog
@@ -121,6 +152,13 @@ export default function VaultDialogs(props: VaultDialogsProps) {
         <label className="field">
           <span>{t('txt_folder_name')}</span>
           <input className="input" value={props.newFolderName} onInput={(e) => props.onNewFolderNameChange((e.currentTarget as HTMLInputElement).value)} />
+        </label>
+      </ConfirmDialog>
+
+      <ConfirmDialog open={props.renameFolderOpen} title={t('txt_edit')} message={t('txt_enter_a_folder_name')} confirmText={t('txt_save')} cancelText={t('txt_cancel')} onConfirm={props.onConfirmRenameFolder} onCancel={props.onCancelRenameFolder}>
+        <label className="field">
+          <span>{t('txt_folder_name')}</span>
+          <input className="input" value={props.renameFolderName} onInput={(e) => props.onRenameFolderNameChange((e.currentTarget as HTMLInputElement).value)} />
         </label>
       </ConfirmDialog>
 
